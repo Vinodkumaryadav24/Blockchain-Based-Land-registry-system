@@ -1,0 +1,296 @@
+6.2 Code Snippets & Explanation
+Below are compact, well-commented code excerpts used in the implementation, with explanations. These snippets cover the core smart contract, deployment, frontend Web3 interactions, Python hashing utility, and a sample Truffle test. For clarity they are minimal yet complete enough to reproduce behavior.
+
+6.2.1 Smart contract — LandRegistry.sol (core excerpts)
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+contract LandRegistry {
+    address public admin;
+
+    constructor() {
+        admin = msg.sender;
+    }
+
+    enum Role { NONE, BUYER, SELLER, ADMIN }
+
+    struct User {
+        address wallet;
+        Role role;
+        bool verified;
+    }
+
+    struct Land {
+        uint256 landId;
+        address owner;
+        string location;
+        uint256 price; // in wei
+        bool verified;
+        bytes32 docHash; // SHA-256 of off-chain doc
+    }
+
+    mapping(address => User) public users;
+    mapping(uint256 => Land) public lands;
+    mapping(uint256 => bool) public landExists;
+
+    event UserRegistered(address indexed user, Role role);
+    event UserVerified(address indexed user);
+    event LandAdded(uint256 indexed landId, address indexed owner);
+    event LandVerified(uint256 indexed landId);
+    event LandPurchased(uint256 indexed landId, address indexed previousOwner, address indexed newOwner, uint256 price);
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin");
+        _;
+    }
+
+    function registerUser(Role _role) external {
+        require(_role != Role.NONE, "Invalid role");
+        User storage u = users[msg.sender];
+        u.wallet = msg.sender;
+        u.role = _role;
+        u.verified = false;
+        emit UserRegistered(msg.sender, _role);
+    }
+
+    function verifyUser(address _user) external onlyAdmin {
+        users[_user].verified = true;
+        emit UserVerified(_user);
+    }
+
+    function addLand(uint256 _landId, string calldata _location, uint256 _price, bytes32 _docHash) external {
+        require(users[msg.sender].role == Role.SELLER && users[msg.sender].verified, "Seller must be verified");
+        require(!landExists[_landId], "Land exists");
+        lands[_landId] = Land({
+            landId: _landId,
+            owner: msg.sender,
+            location: _location,
+            price: _price,
+            verified: false,
+            docHash: _docHash
+        });
+        landExists[_landId] = true;
+        emit LandAdded(_landId, msg.sender);
+    }
+
+    function verifyLand(uint256 _landId) external onlyAdmin {
+        require(landExists[_landId], "No such land");
+        lands[_landId].verified = true;
+        emit LandVerified(_landId);
+    }
+
+    function buyLand(uint256 _landId) external payable {
+        require(landExists[_landId] && lands[_landId].verified, "Land not available");
+        require(msg.value == lands[_landId].price, "Incorrect payment");
+        address seller = lands[_landId].owner;
+        require(seller != msg.sender, "Seller cannot buy own land");
+        // transfer Ether to seller
+        payable(seller).transfer(msg.value);
+        // update ownership
+        address previousOwner = lands[_landId].owner;
+        lands[_landId].owner = msg.sender;
+        emit LandPurchased(_landId, previousOwner, msg.sender, msg.value);
+    }
+
+    // helper read function
+    function getLand(uint256 _landId) external view returns (Land memory) {
+        require(landExists[_landId], "Not exist");
+        return lands[_landId];
+    }
+}
+Explanation
+•	admin is the contract deployer; only admin can verify users/lands.
+•	registerUser sets up the role but keeps verified=false.
+•	addLand requires a verified seller and records docHash (SHA-256) as proof of document integrity (off-chain).
+•	buyLand requires exact payment (in wei). It uses transfer() to send funds to seller and updates the owner.
+•	Events are emitted for every critical action to create on-chain audit logs.
+Security notes:
+•	Solidity ^0.8.17 includes overflow checks, and require() protects logic.
+•	For production use consider pull-over-push pattern for payments or escrow to avoid reentrancy concerns; this simple transfer() is safe against reentrancy because transfer forwards limited gas.
+
+6.2.2 Truffle migration — migrations/2_deploy_land.js
+const LandRegistry = artifacts.require("LandRegistry");
+
+module.exports = function(deployer) {
+  deployer.deploy(LandRegistry);
+};
+Explanation
+•	A standard migration script that deploys the contract to the configured network.
+•	After migration, the address and ABI appear in build/contracts/LandRegistry.json.
+
+6.2.3 Frontend — Web3.js (wallet connect & call examples)
+client/app.js (essential functions)
+let web3;
+let contract;
+let accounts;
+
+async function init() {
+  if (window.ethereum) {
+    web3 = new Web3(window.ethereum);
+    await window.ethereum.request({ method: 'eth_requestAccounts' });
+    accounts = await web3.eth.getAccounts();
+    const networkId = await web3.eth.net.getId();
+    // load ABI & address (assume placed at client/landABI.json)
+    const artifact = await fetch('landABI.json').then(r => r.json());
+    const abi = artifact.abi;
+    const address = artifact.networks[networkId].address;
+    contract = new web3.eth.Contract(abi, address);
+    console.log('Connected', accounts[0]);
+  } else {
+    alert('Please install MetaMask.');
+  }
+}
+
+async function registerUser(role) {
+  // role: 1 buyer, 2 seller, etc. match enum
+  await contract.methods.registerUser(role).send({ from: accounts[0] });
+}
+
+async function addLand(landId, location, priceWei, docHashHex) {
+  await contract.methods.addLand(landId, location, priceWei, docHashHex).send({ from: accounts[0] });
+}
+
+async function buyLand(landId, priceWei) {
+  await contract.methods.buyLand(landId).send({ from: accounts[0], value: priceWei });
+}
+Explanation
+•	init() connects to MetaMask, loads contract ABI + address and instantiates contract.
+•	registerUser, addLand, buyLand wrap contract calls. Each send() will trigger MetaMask to request user confirmation and sign the transaction.
+UI integration:
+•	Use event listeners on buttons (Connect, Register, Add Land, Buy) that call these functions.
+•	Show transaction hash and confirmation status to the user.
+
+6.2.4 Python utility — hashing & optional IPFS push
+backend/hash_and_store.py
+import hashlib
+import json
+from pathlib import Path
+
+def sha256_file(filepath: str) -> str:
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(8192)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+if __name__ == "__main__":
+    p = "docs/sample_deed.pdf"
+    digest = sha256_file(p)
+    print("SHA256:", digest)
+    # Optionally write mapping record
+    Path("backend/hashes.json").write_text(json.dumps({p: digest}))
+Explanation
+•	Computes SHA-256 of the file and returns hex string.
+•	The smart contract stores the bytes32 form: when passing to solidity, convert hex into bytes32 (e.g., web3.utils.asciiToHex/web3.utils.hexToBytes or just pass 0x + hex). In the Solidity example we used bytes32 docHash, so the hex should be converted accordingly.
+Security/privacy note:
+•	We do not store raw docs on-chain. Either store them off-chain (server or IPFS) and store hash/CID on-chain. Hash proves immutability and integrity without exposing contents.
+
+6.2.5 Truffle test example — test/land.test.js
+const LandRegistry = artifacts.require("LandRegistry");
+
+contract("LandRegistry", accounts => {
+  const admin = accounts[0];
+  const seller = accounts[1];
+  const buyer = accounts[2];
+
+  it("registers and verifies user and allows seller to add land", async () => {
+    const instance = await LandRegistry.deployed();
+
+    // seller registers as SELLER (assume enum SELLER = 2)
+    await instance.registerUser(2, { from: seller });
+
+    // admin verifies seller
+    await instance.verifyUser(seller, { from: admin });
+
+    // seller adds land
+    const landId = 101;
+    const price = web3.utils.toWei("1", "ether");
+    const docHash = web3.utils.sha3("sample-doc"); // sample
+    await instance.addLand(landId, "Village X", price, docHash, { from: seller });
+
+    const land = await instance.getLand(landId);
+    assert.equal(land.owner, seller, "Owner should be seller");
+  });
+
+  it("allows buyer to buy and updates owner", async () => {
+    const instance = await LandRegistry.deployed();
+    const landId = 101;
+    const price = web3.utils.toWei("1", "ether");
+
+    // buyer registers and admin verifies buyer
+    await instance.registerUser(1, { from: buyer });
+    await instance.verifyUser(buyer, { from: accounts[0] });
+
+    // admin verifies land
+    await instance.verifyLand(landId, { from: accounts[0] });
+
+    // buyer purchases
+    await instance.buyLand(landId, { from: buyer, value: price });
+
+    const land = await instance.getLand(landId);
+    assert.equal(land.owner, buyer, "Owner should now be buyer");
+  });
+
+});
+Explanation
+•	Tests the happy path: register seller -> admin verify -> seller add land -> admin verify land -> buyer purchase -> ownership update.
+•	Uses web3.utils.toWei to convert ether values to wei when sending funds.
+
+6.2.6 Important Implementation Notes & Best Practices
+•	Testing environment: Ganache provides deterministic behavior; always test thoroughly on Ganache before any public testnet.
+•	Gas & optimization: Consolidate storage writes; prefer emitting events rather than heavy return values to save gas.
+•	Payment handling: For production, consider escrow or pull-payment patterns (have buyers pull funds) to avoid edge-case failures and ensure refund flows.
+•	Admin account security: Store admin key securely; for demo, admin is the deployer (accounts[0]).
+•	Document linking: Use IPFS for document storage; store CID and hash on-chain for verifiability.
+•	Error messages: Provide front-end friendly error handling (parse require message and show to user).
+
+6.2.7 Example: converting Python hash to solidity bytes32 via Web3
+If Python produced hex SHA-256 digest (no 0x), in JS convert to bytes32 and pass:
+const hexHash = "0x" + digest; // digest from python
+await contract.methods.addLand(landId, location, priceWei, hexHash)
+  .send({ from: sellerAccount });
+Solidity bytes32 docHash will accept 0x prefixed 32-byte hex.
+
+6.2.8 Deployment checklist before demo
+•	truffle migrate --reset
+•	Copy build/contracts/LandRegistry.json to client/landABI.json
+•	Start simple HTTP server in client/ (e.g., npx http-server . -p 8080) to avoid file:// CORS issues.
+•	Open index.html, connect MetaMask, and run flows: register user -> admin verify (use admin account in MetaMask) -> seller add land -> admin verify land -> buyer buy land.
+
+6.2.4 Python utility — hashing & optional IPFS push
+backend/hash_and_store.py
+import hashlib
+import json
+from pathlib import Path
+
+def sha256_file(filepath: str) -> str:
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(8192)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+if __name__ == "__main__":
+    p = "docs/sample_deed.pdf"
+    digest = sha256_file(p)
+    print("SHA256:", digest)
+    # Optionally write mapping record
+    Path("backend/hashes.json").write_text(json.dumps({p: digest}))
+Explanation
+•	Computes SHA-256 of the file and returns hex string.
+•	The smart contract stores the bytes32 form: when passing to solidity, convert hex into bytes32 (e.g., web3.utils.asciiToHex/web3.utils.hexToBytes or just pass 0x + hex). In the Solidity example we used bytes32 docHash, so the hex should be converted accordingly.
+Security/privacy note:
+•	We do not store raw docs on-chain. Either store them off-chain (server or IPFS) and store hash/CID on-chain. Hash proves immutability and integrity without exposing contents.
+
+Closing notes for Chapter 6
+The code snippets and step-by-step instructions above give a full, replicable implementation pipeline: from writing and deploying the smart contract, to building the DApp and integrating off-chain utilities like the Python hashing tool. For a production-ready release, additional considerations—security audits, multi-signature admin controls, on-chain/upgradable contract patterns, and regulatory compliance—should be applied.
+If you want, I can:
+•	Provide the complete Solidity file and full frontend files ready to paste, or
+•	Generate screenshots and step-by-step terminal commands for your report, or
+•	Proceed to expanded Chapters 7–9 with the same level of detail.
